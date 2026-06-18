@@ -5,10 +5,27 @@
 
 const DB_NAME = 'CloudDriveDB';
 const STORE_NAME = 'files';
+const USER_STORE = 'users';
+const SESSION_KEY = 'clouddrive_current_user';
 const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB
 let db;
+let currentUser = null;
 
 // DOM Elements
+const authView = document.getElementById('auth-view');
+const dashboard = document.getElementById('dashboard');
+const loginTab = document.getElementById('login-tab');
+const signupTab = document.getElementById('signup-tab');
+const loginForm = document.getElementById('login-form');
+const signupForm = document.getElementById('signup-form');
+const loginEmail = document.getElementById('login-email');
+const loginPassword = document.getElementById('login-password');
+const signupName = document.getElementById('signup-name');
+const signupEmail = document.getElementById('signup-email');
+const signupPassword = document.getElementById('signup-password');
+const userMenu = document.getElementById('user-menu');
+const userPill = document.getElementById('user-pill');
+const logoutBtn = document.getElementById('logout-btn');
 const uploadZone = document.getElementById('upload-zone');
 const fileInput = document.getElementById('file-input');
 const progressBar = document.getElementById('upload-progress-bar');
@@ -38,9 +55,9 @@ async function initApp() {
   try {
     await initDB();
     dbStatus.innerHTML = '<span class="status-dot"></span> Connected';
-    await refreshFileList();
     setupEventListeners();
-    showToast('Cloud storage ready', 'info');
+    await restoreSession();
+    updateAuthView();
   } catch (error) {
     dbStatus.innerHTML = '<span class="status-dot" style="background:var(--danger-color);box-shadow:0 0 8px var(--danger-color)"></span> DB Error';
     showToast('Failed to initialize storage: ' + error, 'error');
@@ -52,7 +69,7 @@ async function initApp() {
 // =============================================
 function initDB() {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1);
+    const request = indexedDB.open(DB_NAME, 2);
 
     request.onerror = () => reject('IndexedDB error: ' + request.error);
 
@@ -66,8 +83,193 @@ function initDB() {
       if (!database.objectStoreNames.contains(STORE_NAME)) {
         database.createObjectStore(STORE_NAME, { keyPath: 'id' });
       }
+      if (!database.objectStoreNames.contains(USER_STORE)) {
+        const userStore = database.createObjectStore(USER_STORE, { keyPath: 'id' });
+        userStore.createIndex('email', 'email', { unique: true });
+      }
     };
   });
+}
+
+// =============================================
+// Authentication
+// =============================================
+async function restoreSession() {
+  const savedUserId = localStorage.getItem(SESSION_KEY);
+  if (!savedUserId) return;
+
+  const user = await getUserById(savedUserId);
+  if (user) {
+    currentUser = sanitizeUser(user);
+  } else {
+    localStorage.removeItem(SESSION_KEY);
+  }
+}
+
+async function handleSignup(e) {
+  e.preventDefault();
+
+  const name = signupName.value.trim();
+  const email = normalizeEmail(signupEmail.value);
+  const password = signupPassword.value;
+
+  if (!name) {
+    showToast('Please enter your name', 'warning');
+    return;
+  }
+
+  if (password.length < 6) {
+    showToast('Password must be at least 6 characters', 'warning');
+    return;
+  }
+
+  try {
+    const existingUser = await getUserByEmail(email);
+    if (existingUser) {
+      showToast('An account already exists for this email', 'error');
+      return;
+    }
+
+    const user = {
+      id: 'user-' + Date.now() + '-' + Math.random().toString(36).substring(2, 9),
+      name: name,
+      email: email,
+      passwordHash: await hashPassword(password),
+      createdAt: new Date().toISOString()
+    };
+
+    await saveUser(user);
+    setCurrentUser(user);
+    signupForm.reset();
+    showToast('Account created successfully', 'success');
+  } catch (err) {
+    showToast('Could not create account', 'error');
+  }
+}
+
+async function handleLogin(e) {
+  e.preventDefault();
+
+  const email = normalizeEmail(loginEmail.value);
+  const password = loginPassword.value;
+
+  try {
+    const user = await getUserByEmail(email);
+    if (!user || user.passwordHash !== await hashPassword(password)) {
+      showToast('Invalid email or password', 'error');
+      return;
+    }
+
+    setCurrentUser(user);
+    loginForm.reset();
+    showToast('Welcome back, ' + user.name, 'success');
+  } catch (err) {
+    showToast('Login failed', 'error');
+  }
+}
+
+function logout() {
+  currentUser = null;
+  localStorage.removeItem(SESSION_KEY);
+  searchInput.value = '';
+  updateStats([]);
+  renderTable([]);
+  updateAuthView();
+  showToast('Logged out successfully', 'info');
+}
+
+function setCurrentUser(user) {
+  currentUser = sanitizeUser(user);
+  localStorage.setItem(SESSION_KEY, currentUser.id);
+  updateAuthView();
+}
+
+async function updateAuthView() {
+  const isLoggedIn = Boolean(currentUser);
+
+  authView.hidden = isLoggedIn;
+  dashboard.hidden = !isLoggedIn;
+  userMenu.hidden = !isLoggedIn;
+
+  if (isLoggedIn) {
+    userPill.textContent = currentUser.name;
+    await refreshFileList();
+  } else {
+    userPill.textContent = '';
+    showAuthMode('login');
+  }
+}
+
+function showAuthMode(mode) {
+  const isLogin = mode === 'login';
+  loginTab.classList.toggle('active', isLogin);
+  signupTab.classList.toggle('active', !isLogin);
+  loginForm.classList.toggle('active', isLogin);
+  signupForm.classList.toggle('active', !isLogin);
+}
+
+function saveUser(user) {
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([USER_STORE], 'readwrite');
+    const store = transaction.objectStore(USER_STORE);
+    const request = store.put(user);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject('Failed to save user');
+  });
+}
+
+function getUserById(id) {
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([USER_STORE], 'readonly');
+    const store = transaction.objectStore(USER_STORE);
+    const request = store.get(id);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject('User not found');
+  });
+}
+
+function getUserByEmail(email) {
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([USER_STORE], 'readonly');
+    const store = transaction.objectStore(USER_STORE);
+    const index = store.index('email');
+    const request = index.get(email);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject('User not found');
+  });
+}
+
+async function hashPassword(password) {
+  if (!window.crypto || !crypto.subtle) {
+    return fallbackHash(password);
+  }
+
+  const encoded = new TextEncoder().encode(password);
+  const digest = await crypto.subtle.digest('SHA-256', encoded);
+  return Array.from(new Uint8Array(digest))
+    .map(byte => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function fallbackHash(value) {
+  let hash = 0;
+  for (let i = 0; i < value.length; i++) {
+    hash = ((hash << 5) - hash) + value.charCodeAt(i);
+    hash |= 0;
+  }
+  return 'fallback-' + Math.abs(hash).toString(16);
+}
+
+function sanitizeUser(user) {
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email
+  };
+}
+
+function normalizeEmail(email) {
+  return email.trim().toLowerCase();
 }
 
 // =============================================
@@ -143,6 +345,11 @@ function simulateUploadProgress() {
 // File Upload Handler
 // =============================================
 async function handleFiles(fileList) {
+  if (!currentUser) {
+    showToast('Please login before uploading files', 'warning');
+    return;
+  }
+
   const files = Array.from(fileList);
 
   if (files.length === 0) return;
@@ -165,6 +372,7 @@ async function handleFiles(fileList) {
         type: file.type || 'application/octet-stream',
         size: file.size,
         date: new Date().toISOString(),
+        ownerId: currentUser.id,
         blob: file
       };
 
@@ -187,8 +395,10 @@ async function handleFiles(fileList) {
 // File List & UI Updates
 // =============================================
 async function refreshFileList() {
+  if (!currentUser) return;
+
   try {
-    const allFiles = await getAllFiles();
+    const allFiles = (await getAllFiles()).filter(file => file.ownerId === currentUser.id);
     const query = searchInput.value.toLowerCase().trim();
 
     const filteredFiles = query
@@ -294,7 +504,7 @@ function renderTable(files) {
 async function downloadFile(id) {
   try {
     const fileRecord = await getFileById(id);
-    if (!fileRecord || !fileRecord.blob) {
+    if (!fileRecord || !fileRecord.blob || fileRecord.ownerId !== currentUser.id) {
       showToast('File not found in storage', 'error');
       return;
     }
@@ -329,6 +539,13 @@ async function executeDelete() {
   if (!fileToDelete) return;
 
   try {
+    const fileRecord = await getFileById(fileToDelete);
+    if (!fileRecord || fileRecord.ownerId !== currentUser.id) {
+      showToast('File not found in your account', 'error');
+      closeModal();
+      return;
+    }
+
     await deleteFileFromDB(fileToDelete);
     showToast('File deleted from cloud storage', 'success');
 
@@ -358,6 +575,13 @@ function closeModal() {
 // Event Listeners
 // =============================================
 function setupEventListeners() {
+  // Authentication
+  loginTab.addEventListener('click', () => showAuthMode('login'));
+  signupTab.addEventListener('click', () => showAuthMode('signup'));
+  loginForm.addEventListener('submit', handleLogin);
+  signupForm.addEventListener('submit', handleSignup);
+  logoutBtn.addEventListener('click', logout);
+
   // Click to upload
   uploadZone.addEventListener('click', () => fileInput.click());
 
