@@ -57,7 +57,7 @@
       <div class="auth-copy">
         <span class="auth-kicker">Private cloud workspace</span>
         <h2>Sign in to manage your files</h2>
-        <p>Create a local CloudDrive account, upload files, and keep each account's library separate on this browser.</p>
+        <p>Create a CloudDrive account, upload files, and access your private library across devices.</p>
       </div>
 
       <div class="auth-card">
@@ -227,6 +227,16 @@
     <p>&copy; 2026 CloudDrive. Cloud-based file storage platform.</p>
   </footer>
 
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+    const SUPABASE_URL = 'https://fstckfzimtmmgnlqshfq.supabase.co';
+    const SUPABASE_ANON_KEY = 'sb_publishable_tDJldIw6f4YA59c-mYHlIA_okqRK4cm';
+
+    const supabase = window.supabase.createClient(
+      SUPABASE_URL,
+      SUPABASE_ANON_KEY
+    );
+  </script>
   <script src="app.js"></script>
 </body>
 </html>

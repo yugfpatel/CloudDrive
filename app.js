@@ -1,15 +1,16 @@
 /**
- * CloudDrive — Client-Side File Storage using IndexedDB
- * Handles upload, download, delete, search, and UI updates
+ * CloudDrive - Supabase-backed cloud file storage
+ * Handles auth, upload, download, delete, search, and UI updates.
  */
 
-const DB_NAME = 'CloudDriveDB';
-const STORE_NAME = 'files';
-const USER_STORE = 'users';
-const SESSION_KEY = 'clouddrive_current_user';
+const SUPABASE_URL = 'https://fstckfzimtmmgnlqshfq.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_tDJldIw6f4YA59c-mYHlIA_okqRK4cm';
+const STORAGE_BUCKET = 'user-files';
 const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB
-let db;
+
+let supabaseClient = null;
 let currentUser = null;
+let fileToDelete = null;
 
 // DOM Elements
 const authView = document.getElementById('auth-view');
@@ -46,68 +47,69 @@ const statFileTypes = document.getElementById('stat-file-types');
 const statLastUpload = document.getElementById('stat-last-upload');
 const dbStatus = document.getElementById('db-status');
 
-let fileToDelete = null;
-
 // =============================================
 // Initialize App
 // =============================================
 async function initApp() {
-  try {
-    await initDB();
-    dbStatus.innerHTML = '<span class="status-dot"></span> Connected';
-    setupEventListeners();
-    await restoreSession();
+  setupEventListeners();
+
+  if (!initSupabase()) {
+    setStatus('Setup needed', 'warning');
     updateAuthView();
+    showToast('Add your Supabase URL and anon key in app.js', 'warning');
+    return;
+  }
+
+  try {
+    setStatus('Connected', 'success');
+    const { data, error } = await supabaseClient.auth.getSession();
+    if (error) throw error;
+
+    currentUser = data.session ? data.session.user : null;
+    updateAuthView();
+
+    supabaseClient.auth.onAuthStateChange((_event, session) => {
+      currentUser = session ? session.user : null;
+      updateAuthView();
+    });
   } catch (error) {
-    dbStatus.innerHTML = '<span class="status-dot" style="background:var(--danger-color);box-shadow:0 0 8px var(--danger-color)"></span> DB Error';
-    showToast('Failed to initialize storage: ' + error, 'error');
+    setStatus('Backend Error', 'error');
+    showToast('Failed to connect to Supabase', 'error');
   }
 }
 
-// =============================================
-// IndexedDB Setup
-// =============================================
-function initDB() {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 2);
+function initSupabase() {
+  const hasConfig =
+    SUPABASE_URL &&
+    SUPABASE_ANON_KEY &&
+    !SUPABASE_URL.includes('YOUR-PROJECT') &&
+    !SUPABASE_ANON_KEY.includes('YOUR_SUPABASE');
 
-    request.onerror = () => reject('IndexedDB error: ' + request.error);
+  if (!hasConfig || !window.supabase) return false;
 
-    request.onsuccess = (e) => {
-      db = e.target.result;
-      resolve(db);
-    };
+  supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  return true;
+}
 
-    request.onupgradeneeded = (e) => {
-      const database = e.target.result;
-      if (!database.objectStoreNames.contains(STORE_NAME)) {
-        database.createObjectStore(STORE_NAME, { keyPath: 'id' });
-      }
-      if (!database.objectStoreNames.contains(USER_STORE)) {
-        const userStore = database.createObjectStore(USER_STORE, { keyPath: 'id' });
-        userStore.createIndex('email', 'email', { unique: true });
-      }
-    };
-  });
+function setStatus(label, type) {
+  const color = type === 'error'
+    ? 'var(--danger-color)'
+    : type === 'warning'
+      ? 'var(--amber-color)'
+      : 'var(--success-color)';
+
+  dbStatus.innerHTML =
+    '<span class="status-dot" style="background:' + color + ';box-shadow:0 0 8px ' + color + '"></span>' +
+    escapeHTML(label);
 }
 
 // =============================================
 // Authentication
 // =============================================
-async function restoreSession() {
-  const savedUserId = localStorage.getItem(SESSION_KEY);
-  if (!savedUserId) return;
-
-  const user = await getUserById(savedUserId);
-  if (user) {
-    currentUser = sanitizeUser(user);
-  } else {
-    localStorage.removeItem(SESSION_KEY);
-  }
-}
-
 async function handleSignup(e) {
   e.preventDefault();
+
+  if (!ensureBackendReady()) return;
 
   const name = signupName.value.trim();
   const email = normalizeEmail(signupEmail.value);
@@ -124,53 +126,67 @@ async function handleSignup(e) {
   }
 
   try {
-    const existingUser = await getUserByEmail(email);
-    if (existingUser) {
-      showToast('An account already exists for this email', 'error');
-      return;
-    }
-
-    const user = {
-      id: 'user-' + Date.now() + '-' + Math.random().toString(36).substring(2, 9),
-      name: name,
+    const { data, error } = await supabaseClient.auth.signUp({
       email: email,
-      passwordHash: await hashPassword(password),
-      createdAt: new Date().toISOString()
-    };
+      password: password,
+      options: {
+        data: { name: name }
+      }
+    });
 
-    await saveUser(user);
-    setCurrentUser(user);
+    if (error) throw error;
+
     signupForm.reset();
-    showToast('Account created successfully', 'success');
+
+    if (data.session) {
+      currentUser = data.user;
+      updateAuthView();
+      showToast('Account created successfully', 'success');
+    } else {
+      showAuthMode('login');
+      showToast('Account created. Check your email if confirmation is enabled.', 'success');
+    }
   } catch (err) {
-    showToast('Could not create account', 'error');
+    showToast(err.message || 'Could not create account', 'error');
   }
 }
 
 async function handleLogin(e) {
   e.preventDefault();
 
+  if (!ensureBackendReady()) return;
+
   const email = normalizeEmail(loginEmail.value);
   const password = loginPassword.value;
 
   try {
-    const user = await getUserByEmail(email);
-    if (!user || user.passwordHash !== await hashPassword(password)) {
-      showToast('Invalid email or password', 'error');
-      return;
-    }
+    const { data, error } = await supabaseClient.auth.signInWithPassword({
+      email: email,
+      password: password
+    });
 
-    setCurrentUser(user);
+    if (error) throw error;
+
+    currentUser = data.user;
     loginForm.reset();
-    showToast('Welcome back, ' + user.name, 'success');
+    updateAuthView();
+    showToast('Welcome back, ' + getUserName(currentUser), 'success');
   } catch (err) {
-    showToast('Login failed', 'error');
+    showToast(err.message || 'Invalid email or password', 'error');
   }
 }
 
-function logout() {
+async function logout() {
+  if (!ensureBackendReady()) return;
+
+  try {
+    await supabaseClient.auth.signOut();
+  } catch (err) {
+    showToast('Logout failed', 'error');
+    return;
+  }
+
   currentUser = null;
-  localStorage.removeItem(SESSION_KEY);
   searchInput.value = '';
   updateStats([]);
   renderTable([]);
@@ -178,13 +194,7 @@ function logout() {
   showToast('Logged out successfully', 'info');
 }
 
-function setCurrentUser(user) {
-  currentUser = sanitizeUser(user);
-  localStorage.setItem(SESSION_KEY, currentUser.id);
-  updateAuthView();
-}
-
-async function updateAuthView() {
+function updateAuthView() {
   const isLoggedIn = Boolean(currentUser);
 
   authView.hidden = isLoggedIn;
@@ -192,8 +202,8 @@ async function updateAuthView() {
   userMenu.hidden = !isLoggedIn;
 
   if (isLoggedIn) {
-    userPill.textContent = currentUser.name;
-    await refreshFileList();
+    userPill.textContent = getUserName(currentUser);
+    refreshFileList();
   } else {
     userPill.textContent = '';
     showAuthMode('login');
@@ -208,64 +218,17 @@ function showAuthMode(mode) {
   signupForm.classList.toggle('active', !isLogin);
 }
 
-function saveUser(user) {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction([USER_STORE], 'readwrite');
-    const store = transaction.objectStore(USER_STORE);
-    const request = store.put(user);
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject('Failed to save user');
-  });
+function ensureBackendReady() {
+  if (supabaseClient) return true;
+  showToast('Connect Supabase first: update app.js with your project URL and anon key', 'warning');
+  return false;
 }
 
-function getUserById(id) {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction([USER_STORE], 'readonly');
-    const store = transaction.objectStore(USER_STORE);
-    const request = store.get(id);
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject('User not found');
-  });
-}
-
-function getUserByEmail(email) {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction([USER_STORE], 'readonly');
-    const store = transaction.objectStore(USER_STORE);
-    const index = store.index('email');
-    const request = index.get(email);
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject('User not found');
-  });
-}
-
-async function hashPassword(password) {
-  if (!window.crypto || !crypto.subtle) {
-    return fallbackHash(password);
-  }
-
-  const encoded = new TextEncoder().encode(password);
-  const digest = await crypto.subtle.digest('SHA-256', encoded);
-  return Array.from(new Uint8Array(digest))
-    .map(byte => byte.toString(16).padStart(2, '0'))
-    .join('');
-}
-
-function fallbackHash(value) {
-  let hash = 0;
-  for (let i = 0; i < value.length; i++) {
-    hash = ((hash << 5) - hash) + value.charCodeAt(i);
-    hash |= 0;
-  }
-  return 'fallback-' + Math.abs(hash).toString(16);
-}
-
-function sanitizeUser(user) {
-  return {
-    id: user.id,
-    name: user.name,
-    email: user.email
-  };
+function getUserName(user) {
+  if (!user) return '';
+  return user.user_metadata && user.user_metadata.name
+    ? user.user_metadata.name
+    : user.email;
 }
 
 function normalizeEmail(email) {
@@ -273,46 +236,74 @@ function normalizeEmail(email) {
 }
 
 // =============================================
-// Database Operations (Cloud Storage Simulation)
+// Supabase File Operations
 // =============================================
-function saveFileToDB(fileRecord) {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction([STORE_NAME], 'readwrite');
-    const store = transaction.objectStore(STORE_NAME);
-    const request = store.put(fileRecord);
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject('Failed to save file');
-  });
+async function saveFileMetadata(fileRecord) {
+  const { error } = await supabaseClient
+    .from('files')
+    .insert({
+      id: fileRecord.id,
+      owner_id: currentUser.id,
+      name: fileRecord.name,
+      type: fileRecord.type,
+      size: fileRecord.size,
+      storage_path: fileRecord.storagePath
+    });
+
+  if (error) throw error;
 }
 
-function getAllFiles() {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction([STORE_NAME], 'readonly');
-    const store = transaction.objectStore(STORE_NAME);
-    const request = store.getAll();
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject('Failed to retrieve files');
-  });
+async function getAllFiles() {
+  const { data, error } = await supabaseClient
+    .from('files')
+    .select('id, name, type, size, storage_path, created_at')
+    .order('created_at', { ascending: false });
+
+  if (error) throw error;
+
+  return (data || []).map(row => ({
+    id: row.id,
+    name: row.name,
+    type: row.type,
+    size: row.size,
+    storagePath: row.storage_path,
+    date: row.created_at
+  }));
 }
 
-function getFileById(id) {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction([STORE_NAME], 'readonly');
-    const store = transaction.objectStore(STORE_NAME);
-    const request = store.get(id);
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject('File not found');
-  });
+async function getFileById(id) {
+  const { data, error } = await supabaseClient
+    .from('files')
+    .select('id, name, type, size, storage_path, created_at')
+    .eq('id', id)
+    .single();
+
+  if (error) throw error;
+
+  return {
+    id: data.id,
+    name: data.name,
+    type: data.type,
+    size: data.size,
+    storagePath: data.storage_path,
+    date: data.created_at
+  };
 }
 
-function deleteFileFromDB(id) {
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction([STORE_NAME], 'readwrite');
-    const store = transaction.objectStore(STORE_NAME);
-    const request = store.delete(id);
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject('Failed to delete file');
-  });
+async function deleteFileRecord(fileRecord) {
+  const storageResult = await supabaseClient
+    .storage
+    .from(STORAGE_BUCKET)
+    .remove([fileRecord.storagePath]);
+
+  if (storageResult.error) throw storageResult.error;
+
+  const { error } = await supabaseClient
+    .from('files')
+    .delete()
+    .eq('id', fileRecord.id);
+
+  if (error) throw error;
 }
 
 // =============================================
@@ -335,9 +326,9 @@ function simulateUploadProgress() {
           progressBar.style.width = '0%';
           uploadZone.classList.remove('uploading');
           resolve();
-        }, 400);
+        }, 300);
       }
-    }, 150);
+    }, 140);
   });
 }
 
@@ -351,43 +342,45 @@ async function handleFiles(fileList) {
   }
 
   const files = Array.from(fileList);
-
   if (files.length === 0) return;
 
   for (const file of files) {
-    // Validate file size
     if (file.size > MAX_FILE_SIZE) {
       showToast(file.name + ' exceeds the 100 MB limit', 'error');
       continue;
     }
 
     try {
-      // Show upload progress
       await simulateUploadProgress();
 
-      // Create file record with blob data
-      const fileRecord = {
-        id: Date.now() + '-' + Math.random().toString(36).substring(2, 11),
+      const fileId = createId();
+      const storagePath = currentUser.id + '/' + fileId + '-' + sanitizeFileName(file.name);
+
+      const uploadResult = await supabaseClient
+        .storage
+        .from(STORAGE_BUCKET)
+        .upload(storagePath, file, {
+          contentType: file.type || 'application/octet-stream',
+          upsert: false
+        });
+
+      if (uploadResult.error) throw uploadResult.error;
+
+      await saveFileMetadata({
+        id: fileId,
         name: file.name,
         type: file.type || 'application/octet-stream',
         size: file.size,
-        date: new Date().toISOString(),
-        ownerId: currentUser.id,
-        blob: file
-      };
+        storagePath: storagePath
+      });
 
-      // Save to IndexedDB (simulated cloud storage)
-      await saveFileToDB(fileRecord);
       showToast(file.name + ' uploaded successfully', 'success');
     } catch (err) {
-      showToast('Failed to upload ' + file.name, 'error');
+      showToast('Failed to upload ' + file.name + ': ' + (err.message || 'Unknown error'), 'error');
     }
   }
 
-  // Reset file input so same file can be re-uploaded
   fileInput.value = '';
-
-  // Refresh the file list
   await refreshFileList();
 }
 
@@ -395,10 +388,10 @@ async function handleFiles(fileList) {
 // File List & UI Updates
 // =============================================
 async function refreshFileList() {
-  if (!currentUser) return;
+  if (!currentUser || !supabaseClient) return;
 
   try {
-    const allFiles = (await getAllFiles()).filter(file => file.ownerId === currentUser.id);
+    const allFiles = await getAllFiles();
     const query = searchInput.value.toLowerCase().trim();
 
     const filteredFiles = query
@@ -408,23 +401,19 @@ async function refreshFileList() {
     updateStats(allFiles);
     renderTable(filteredFiles);
   } catch (err) {
-    showToast('Error loading files', 'error');
+    showToast('Error loading files: ' + (err.message || 'Unknown error'), 'error');
   }
 }
 
 function updateStats(files) {
-  // Total files
   statTotalFiles.textContent = files.length;
 
-  // Total size
   const totalSize = files.reduce((acc, f) => acc + (f.size || 0), 0);
   statTotalSize.textContent = formatBytes(totalSize);
 
-  // Unique file type categories
   const types = new Set(files.map(f => getFileCategory(f.type)));
   statFileTypes.textContent = files.length > 0 ? types.size : 0;
 
-  // Last upload date
   if (files.length > 0) {
     const sorted = [...files].sort((a, b) => new Date(b.date) - new Date(a.date));
     const latest = new Date(sorted[0].date);
@@ -458,7 +447,6 @@ function renderTable(files) {
   tableWrapper.style.display = 'block';
   emptyState.style.display = 'none';
 
-  // Sort newest first
   files.sort((a, b) => new Date(b.date) - new Date(a.date));
 
   files.forEach((file, index) => {
@@ -466,10 +454,6 @@ function renderTable(files) {
     tr.setAttribute('data-file-id', file.id);
     tr.style.animationDelay = (index * 0.05) + 's';
     tr.classList.add('file-row-enter');
-
-    const category = getFileCategory(file.type);
-    const badgeClass = 'file-type-badge--' + category;
-    const ext = getFileExtension(file.name);
 
     tr.innerHTML =
       '<td>' +
@@ -504,25 +488,25 @@ function renderTable(files) {
 async function downloadFile(id) {
   try {
     const fileRecord = await getFileById(id);
-    if (!fileRecord || !fileRecord.blob || fileRecord.ownerId !== currentUser.id) {
-      showToast('File not found in storage', 'error');
-      return;
-    }
+    const { data, error } = await supabaseClient
+      .storage
+      .from(STORAGE_BUCKET)
+      .download(fileRecord.storagePath);
 
-    const url = URL.createObjectURL(fileRecord.blob);
+    if (error) throw error;
+
+    const url = URL.createObjectURL(data);
     const a = document.createElement('a');
     a.href = url;
     a.download = fileRecord.name;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-
-    // Clean up the object URL after a short delay
     setTimeout(() => URL.revokeObjectURL(url), 1000);
 
     showToast('Downloading ' + fileRecord.name, 'success');
   } catch (err) {
-    showToast('Download failed', 'error');
+    showToast('Download failed: ' + (err.message || 'Unknown error'), 'error');
   }
 }
 
@@ -540,16 +524,9 @@ async function executeDelete() {
 
   try {
     const fileRecord = await getFileById(fileToDelete);
-    if (!fileRecord || fileRecord.ownerId !== currentUser.id) {
-      showToast('File not found in your account', 'error');
-      closeModal();
-      return;
-    }
-
-    await deleteFileFromDB(fileToDelete);
+    await deleteFileRecord(fileRecord);
     showToast('File deleted from cloud storage', 'success');
 
-    // Animate the row out
     const row = document.querySelector('tr[data-file-id="' + fileToDelete + '"]');
     if (row) {
       row.classList.remove('file-row-enter');
@@ -559,11 +536,10 @@ async function executeDelete() {
       await refreshFileList();
     }
   } catch (err) {
-    showToast('Failed to delete file', 'error');
+    showToast('Failed to delete file: ' + (err.message || 'Unknown error'), 'error');
   }
 
-  confirmModal.style.display = 'none';
-  fileToDelete = null;
+  closeModal();
 }
 
 function closeModal() {
@@ -575,17 +551,14 @@ function closeModal() {
 // Event Listeners
 // =============================================
 function setupEventListeners() {
-  // Authentication
   loginTab.addEventListener('click', () => showAuthMode('login'));
   signupTab.addEventListener('click', () => showAuthMode('signup'));
   loginForm.addEventListener('submit', handleLogin);
   signupForm.addEventListener('submit', handleSignup);
   logoutBtn.addEventListener('click', logout);
 
-  // Click to upload
   uploadZone.addEventListener('click', () => fileInput.click());
 
-  // Keyboard accessibility
   uploadZone.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
@@ -593,7 +566,6 @@ function setupEventListeners() {
     }
   });
 
-  // Drag & Drop
   uploadZone.addEventListener('dragover', (e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -615,35 +587,29 @@ function setupEventListeners() {
     }
   });
 
-  // File input change
   fileInput.addEventListener('change', (e) => {
     if (e.target.files.length > 0) {
       handleFiles(e.target.files);
     }
   });
 
-  // Search
   searchInput.addEventListener('input', () => {
     refreshFileList();
   });
 
-  // Modal buttons
   modalCancel.addEventListener('click', closeModal);
   modalConfirm.addEventListener('click', executeDelete);
 
-  // Close modal on overlay click
   confirmModal.addEventListener('click', (e) => {
     if (e.target === confirmModal) closeModal();
   });
 
-  // Close modal on Escape key
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && confirmModal.style.display !== 'none') {
       closeModal();
     }
   });
 
-  // Delegated event listeners for table action buttons
   fileTableBody.addEventListener('click', (e) => {
     const downloadBtn = e.target.closest('.btn-icon.download');
     const deleteBtn = e.target.closest('.btn-icon.delete');
@@ -679,9 +645,17 @@ function getFileCategory(mimeType) {
   return 'other';
 }
 
-function getFileExtension(filename) {
-  const parts = filename.split('.');
-  return parts.length > 1 ? parts.pop().toUpperCase() : '?';
+function createId() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(char) {
+    const random = Math.random() * 16 | 0;
+    const value = char === 'x' ? random : (random & 0x3 | 0x8);
+    return value.toString(16);
+  });
+}
+
+function sanitizeFileName(filename) {
+  return filename.replace(/[^a-zA-Z0-9._-]/g, '_');
 }
 
 function escapeHTML(str) {
@@ -710,7 +684,6 @@ function showToast(message, type) {
   toast.innerHTML = icon + '<span>' + escapeHTML(message) + '</span>';
   toastContainer.appendChild(toast);
 
-  // Auto-dismiss after 3.5 seconds
   setTimeout(function() {
     toast.classList.add('closing');
     setTimeout(function() {
@@ -733,5 +706,4 @@ function showToast(message, type) {
   document.head.appendChild(style);
 })();
 
-// Start the application
 document.addEventListener('DOMContentLoaded', initApp);
